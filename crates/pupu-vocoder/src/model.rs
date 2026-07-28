@@ -329,18 +329,23 @@ impl PupuVocoder {
     }
 
     pub fn infer(&mut self, audio: &Array, target_length: usize) -> Result<Array> {
+        let mel = self.mel.forward(audio)?;
+        self.infer_mel(&mel, target_length)
+    }
+
+    pub fn infer_mel(&mut self, mel: &Array, target_length: usize) -> Result<Array> {
         Ok(self
-            .infer_internal(audio, false)?
+            .infer_mel_internal(mel, false)?
             .output
             .index((.., ..target_length as i32, ..)))
     }
 
     pub fn infer_with_features(&mut self, audio: &Array) -> Result<PupuFeatures> {
-        self.infer_internal(audio, true)
+        let mel = self.mel.forward(audio)?;
+        self.infer_mel_internal(&mel, true)
     }
 
-    fn infer_internal(&mut self, audio: &Array, capture_features: bool) -> Result<PupuFeatures> {
-        let mel = self.mel.forward(audio)?;
+    fn infer_mel_internal(&mut self, mel: &Array, capture_features: bool) -> Result<PupuFeatures> {
         let mut hidden = self.conv_pre.forward(&mel)?;
         let conv_pre = hidden.clone();
         let source = hidden.clone();
@@ -372,7 +377,7 @@ impl PupuVocoder {
         output.eval()?;
 
         Ok(PupuFeatures {
-            mel,
+            mel: mel.clone(),
             conv_pre,
             resblocks,
             stages,
