@@ -2,17 +2,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use mlx_rs::Array;
 use mlx_rs::builder::Builder;
 use mlx_rs::module::Module;
 use mlx_rs::nn::{Conv1d, Conv1dBuilder};
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::ops::{
-    PadMode, broadcast_to, concatenate_axis, conv_transpose1d, conv1d, eq, maximum, minimum, pad,
-    r#where,
-};
-use mlx_rs::{Array, array};
+use mlx_rs::ops::{concatenate_axis, maximum, minimum};
 
 use crate::MelSpectrogram;
+use crate::metal::{MetalActivationKernel, MetalResampleKernel};
 
 const UPSAMPLE_RATES: [i32; 5] = [8, 8, 2, 2, 2];
 const TOTAL_UPSAMPLE_RATES: [i32; 5] = [8, 64, 128, 256, 512];
@@ -50,67 +48,28 @@ struct Activation1d {
     beta: Array,
     up_filter: Array,
     down_filter: Array,
-    channels: i32,
+    kernel: MetalActivationKernel,
 }
 
 impl Activation1d {
-    fn load(weights: &HashMap<String, Array>, prefix: &str, channels: i32) -> Result<Self> {
+    fn load(weights: &HashMap<String, Array>, prefix: &str) -> Result<Self> {
         Ok(Self {
             alpha: weight(weights, &format!("{prefix}.act.alpha"))?,
             beta: weight(weights, &format!("{prefix}.act.beta"))?,
             up_filter: weight(weights, &format!("{prefix}.upsample.filter"))?,
             down_filter: weight(weights, &format!("{prefix}.downsample.lowpass.filter"))?,
-            channels,
+            kernel: MetalActivationKernel::new()?,
         })
     }
 
     fn forward(&self, input: &Array) -> Result<Array> {
-        let padded = pad(
+        self.kernel.forward(
             input,
-            &[(0, 0), (5, 5), (0, 0)],
-            Array::from(0.0f32),
-            Some(PadMode::Edge),
-        )?;
-        let up_filter = broadcast_to(&self.up_filter, &[self.channels, 12, 1])?;
-        let upsampled = conv_transpose1d(&padded, &up_filter, 2, 0, 1, 0, self.channels)?
-            .multiply(array!(2.0f32))?;
-        let upsampled_length = upsampled.shape()[1];
-        let upsampled = upsampled.index((.., 15..upsampled_length - 15, ..));
-
-        let alpha = self.alpha.exp()?;
-        let beta = self.beta.exp()?;
-        let batch = upsampled.shape()[0];
-        let first = Array::zeros::<f32>(&[batch, 1, self.channels])?;
-        let shifted = concatenate_axis(&[&first, &upsampled.index((.., ..-1i32, ..))], 1)?;
-        let delta = upsampled.subtract(&shifted)?;
-        let sum = upsampled.add(&shifted)?;
-        let sinc_argument = alpha
-            .multiply(&delta)?
-            .divide(Array::from(std::f32::consts::PI))?;
-        let sinc_phase = sinc_argument.multiply(Array::from(std::f32::consts::PI))?;
-        let sinc = r#where(
-            &eq(&sinc_phase, Array::from(0.0f32))?,
-            Array::from(1.0f32),
-            &sinc_phase.sin()?.divide(&sinc_phase)?,
-        )?;
-        let periodic =
-            Array::from(1.0f32).subtract(&alpha.multiply(&sum)?.cos()?.multiply(&sinc)?)?;
-        let activated = sum.divide(Array::from(2.0f32))?.add(
-            &periodic.divide(
-                &beta
-                    .add(Array::from(1e-9f32))?
-                    .multiply(Array::from(2.0f32))?,
-            )?,
-        )?;
-
-        let down_padded = pad(
-            &activated,
-            &[(0, 0), (5, 6), (0, 0)],
-            Array::from(0.0f32),
-            Some(PadMode::Edge),
-        )?;
-        let down_filter = broadcast_to(&self.down_filter, &[self.channels, 12, 1])?;
-        Ok(conv1d(&down_padded, &down_filter, 2, 0, 1, self.channels)?)
+            &self.alpha,
+            &self.beta,
+            &self.up_filter,
+            &self.down_filter,
+        )
     }
 }
 
@@ -152,12 +111,10 @@ impl ResBlock1 {
             activations.push(Activation1d::load(
                 weights,
                 &format!("resblocks.{index}.activations.{}", layer * 2),
-                channels,
             )?);
             activations.push(Activation1d::load(
                 weights,
                 &format!("resblocks.{index}.activations.{}", layer * 2 + 1),
-                channels,
             )?);
         }
         Ok(Self {
@@ -183,10 +140,11 @@ struct ResampleUpsampler {
     scale_factor: i32,
     total_scale_factor: i32,
     channels: i32,
-    input_insert_kernel: Array,
-    source_insert_kernel: Array,
+    source_head_weight: Array,
+    source_tail_weight: Array,
+    source_bias: Array,
     julius_filter: Array,
-    convolution_noise: Conv1d,
+    kernel: MetalResampleKernel,
     convolution_after: Conv1d,
 }
 
@@ -199,22 +157,51 @@ impl ResampleUpsampler {
         input_channels: i32,
         output_channels: i32,
     ) -> Result<Self> {
+        let convolution_noise = conv1d_layer(
+            weights,
+            &format!("ups.{index}.convolution_noise"),
+            INITIAL_CHANNELS,
+            input_channels,
+            7,
+            3,
+            1,
+        )?;
+        let source_head_weight = concatenate_axis(
+            &[
+                convolution_noise.weight.value.index((.., 3..4, ..)),
+                convolution_noise.weight.value.index((.., 2..3, ..)),
+                convolution_noise.weight.value.index((.., 1..2, ..)),
+                convolution_noise.weight.value.index((.., 0..1, ..)),
+            ],
+            1,
+        )?
+        .transpose_axes(&[2, 1, 0])?
+        .reshape(&[INITIAL_CHANNELS, 4 * input_channels])?;
+        let source_tail_weight = concatenate_axis(
+            &[
+                convolution_noise.weight.value.index((.., 6..7, ..)),
+                convolution_noise.weight.value.index((.., 5..6, ..)),
+                convolution_noise.weight.value.index((.., 4..5, ..)),
+            ],
+            1,
+        )?
+        .transpose_axes(&[2, 1, 0])?
+        .reshape(&[INITIAL_CHANNELS, 3 * input_channels])?;
+        source_head_weight.eval()?;
+        source_tail_weight.eval()?;
+        let source_bias = convolution_noise
+            .bias
+            .value
+            .context("Pupu convolution_noise 缺少 bias")?;
         Ok(Self {
             scale_factor,
             total_scale_factor,
             channels: input_channels,
-            input_insert_kernel: Array::ones::<f32>(&[input_channels, 1, 1])?,
-            source_insert_kernel: Array::ones::<f32>(&[INITIAL_CHANNELS, 1, 1])?,
+            source_head_weight,
+            source_tail_weight,
+            source_bias,
             julius_filter: weight(weights, &format!("ups.{index}.julius_filter"))?,
-            convolution_noise: conv1d_layer(
-                weights,
-                &format!("ups.{index}.convolution_noise"),
-                INITIAL_CHANNELS,
-                input_channels,
-                7,
-                3,
-                1,
-            )?,
+            kernel: MetalResampleKernel::new()?,
             convolution_after: conv1d_layer(
                 weights,
                 &format!("ups.{index}.convolution_after"),
@@ -227,46 +214,35 @@ impl ResampleUpsampler {
         })
     }
 
-    fn lowpass(&self, input: &Array) -> Result<Array> {
-        let half_size = (self.julius_filter.shape()[1] - 1) / 2;
-        let padded = pad(
-            input,
-            &[(0, 0), (half_size, half_size), (0, 0)],
-            Array::from(0.0f32),
-            Some(PadMode::Edge),
-        )?;
-        let filter = broadcast_to(
-            &self.julius_filter,
-            &[self.channels, self.julius_filter.shape()[1], 1],
-        )?;
-        Ok(conv1d(&padded, &filter, 1, 0, 1, self.channels)?)
-    }
-
     fn forward(&mut self, input: &Array, source: &Array) -> Result<Array> {
-        let source_upsampled = conv_transpose1d(
-            source,
-            &self.source_insert_kernel,
-            self.total_scale_factor,
-            0,
-            1,
-            self.total_scale_factor - 1,
-            INITIAL_CHANNELS,
-        )?;
-        let source_filtered = self.convolution_noise.forward(&source_upsampled)?;
-        let source_highpass = source_filtered.subtract(&self.lowpass(&source_filtered)?)?;
-
-        let upsampled = conv_transpose1d(
-            input,
-            &self.input_insert_kernel,
-            self.scale_factor,
-            0,
-            1,
-            self.scale_factor - 1,
+        let batch = source.shape()[0];
+        let frames = source.shape()[1];
+        let head =
+            source
+                .matmul(&self.source_head_weight)?
+                .reshape(&[batch, frames, 4, self.channels])?;
+        let final_source_frame = Array::zeros::<f32>(&[batch, 1, INITIAL_CHANNELS])?;
+        let shifted_source =
+            concatenate_axis(&[&source.index((.., 1.., ..)), &final_source_frame], 1)?;
+        let tail = shifted_source.matmul(&self.source_tail_weight)?.reshape(&[
+            batch,
+            frames,
+            3,
             self.channels,
+        ])?;
+        let empty_phases =
+            Array::zeros::<f32>(&[batch, frames, self.total_scale_factor - 7, self.channels])?;
+        let source_filtered = concatenate_axis(&[&head, &empty_phases, &tail], 2)?
+            .reshape(&[batch, frames * self.total_scale_factor, self.channels])?
+            .add(&self.source_bias)?;
+        let combined = self.kernel.forward(
+            input,
+            &source_filtered,
+            &self.julius_filter,
+            self.scale_factor,
         )?;
-        let filtered = self.lowpass(&upsampled)?;
         self.convolution_after
-            .forward(&filtered.add(&source_highpass)?)
+            .forward(&combined)
             .map_err(Into::into)
     }
 }
@@ -323,7 +299,7 @@ impl PupuVocoder {
             conv_pre,
             upsamplers,
             resblocks,
-            activation_post: Activation1d::load(&weights, "activation_post", channels)?,
+            activation_post: Activation1d::load(&weights, "activation_post")?,
             conv_post: conv1d_layer(&weights, "conv_post", channels, 1, 7, 3, 1)?,
         })
     }
@@ -346,7 +322,7 @@ impl PupuVocoder {
     }
 
     fn infer_mel_internal(&mut self, mel: &Array, capture_features: bool) -> Result<PupuFeatures> {
-        let mut hidden = self.conv_pre.forward(&mel)?;
+        let mut hidden = self.conv_pre.forward(mel)?;
         let conv_pre = hidden.clone();
         let source = hidden.clone();
         let mut resblocks = Vec::with_capacity(if capture_features { 15 } else { 0 });
@@ -364,7 +340,6 @@ impl PupuVocoder {
                 .add(&second)?
                 .add(&third)?
                 .divide(Array::from(3.0f32))?;
-            hidden.eval()?;
             if capture_features {
                 stages.push(hidden.clone());
             }

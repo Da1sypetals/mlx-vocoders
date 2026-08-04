@@ -1,5 +1,6 @@
 mod audio;
 mod mel;
+mod metal;
 mod model;
 
 pub use audio::{load_mono_audio, save_pcm16_wav};

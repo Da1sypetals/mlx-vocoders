@@ -741,6 +741,7 @@ dependencies = [
  "hound",
  "metal",
  "mlx-rs",
+ "mlx-sys",
  "soxr",
 ]
 
